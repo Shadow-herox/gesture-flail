@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Flail — Gesture Controlled (Computer Vision)</title>
+
+<!-- MediaPipe Hands & Camera Utils CDNs -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #f8fafc;
+    color: #0f172a;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    user-select: none;
+  }
+  canvas { display: block; }
+
+  /* Hidden Video element for CV processing */
+  #webcam { display: none; }
+
+  /* Camera Feed Preview (Bottom Corner) */
+  #cam-preview-container {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    width: 160px;
+    height: 120px;
+    border-radius: 12px;
+    overflow: hidden;
+    border: 2px solid #e2e8f0;
+    box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
+    background: #000;
+    z-index: 5;
+  }
+  #cam-preview {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    transform: scaleX(-1); /* Mirror camera preview */
+  }
+
+  /* Status Indicator */
+  #cv-status {
+    position: fixed;
+    top: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    padding: 0.5rem 1.25rem;
+    border-radius: 9999px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: #64748b;
+    box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    z-index: 5;
+  }
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #94a3b8;
+  }
+  .status-dot.active { background: #16a34a; }
+  .status-dot.fist { background: #2563eb; }
+
+  /* Minimal UI Overlay */
+  #overlay {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(248, 250, 252, 0.88);
+    backdrop-filter: blur(8px);
+    z-index: 10;
+  }
+  #overlay.hidden { display: none; }
+
+  .card {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    box-shadow: 0 20px 25px -5px rgba(15, 23, 42, 0.05);
+    border-radius: 24px;
+    padding: 2.5rem;
+    width: 100%;
+    max-width: 420px;
+    text-align: center;
+  }
+
+  .title {
+    font-size: 2rem;
+    font-weight: 800;
+    letter-spacing: -0.03em;
+    color: #0f172a;
+    margin-bottom: 0.35rem;
+  }
+  .sub {
+    font-size: 0.9rem;
+    color: #64748b;
+    margin-bottom: 1.5rem;
+    line-height: 1.5;
+  }
+
+  .btn {
+    background: #0f172a;
+    color: #ffffff;
+    border: none;
+    border-radius: 12px;
+    padding: 0.875rem 2rem;
+    font-size: 0.975rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s ease;
+    width: 100%;
+  }
+  .btn:hover { background: #334155; }
+  .btn:disabled { background: #94a3b8; cursor: not-allowed; }
+
+  .score-display {
+    font-size: 1.75rem;
+    font-weight: 800;
+    color: #2563eb;
+    margin-bottom: 0.25rem;
+  }
+  .hs-display {
+    font-size: 0.875rem;
+    color: #94a3b8;
+    margin-bottom: 1.25rem;
+    font-weight: 500;
+  }
+</style>
+</head>
+<body>
+
+<canvas id="c"></canvas>
+<video id="webcam" playsinline></video>
+
+<!-- Live Camera Corner Preview -->
+<div id="cam-preview-container">
+  <video id="cam-preview" autoplay playsinline muted></video>
+</div>
+
+<!-- Computer Vision Detection Status -->
+<div id="cv-status">
+  <div class="status-dot" id="statusDot"></div>
+  <span id="statusText">Initializing Camera Vision...</span>
+</div>
+
+<!-- Start/Game Over Overlay -->
+<div id="overlay">
+  <div class="card">
+    <div class="title" id="overlayTitle">Gesture Flail</div>
+    <div class="sub" id="overlaySub">Hold a ✊ <b>FIST</b> in front of your camera to control the Blue Ball and swing the flail.</div>
+    <div class="score-display" id="overlayScore" style="display:none"></div>
+    <div class="hs-display" id="overlayHS" style="display:none"></div>
+    <button class="btn" id="startBtn" disabled>Starting Camera...</button>
+  </div>
+</div>
+
+<script>
+// ─── Canvas & Game State Setup ─────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+
+function resize() {
+  canvas.width  = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+resize();
+window.addEventListener('resize', resize);
+
+let state = 'idle'; 
+let score = 0, highScore = 0, elapsed = 0, kills = 0, lastTime = 0;
+
+// Player & Physics setup
+const PLAYER_R    = 14;
+const WEIGHT_R    = 16;
+const REST_LEN    = 180;
+const SPRING_K    = 520;      
+const SPRING_DAMP = 1.0;      
+const GRAVITY     = 120;      
+
+let player = { x: canvas.width / 2, y: canvas.height / 2 };
+let weight = { x: canvas.width / 2, y: canvas.height / 2 + REST_LEN, vx: 0, vy: 0 };
+let targetX = canvas.width / 2;
+let targetY = canvas.height / 2;
+
+// Mouse fallback for debugging
+canvas.addEventListener('mousemove', e => {
+  if (!isCameraReady) {
+    targetX = e.clientX;
+    targetY = e.clientY;
+  }
+});
+
+// ─── Image Processing / MediaPipe Hand Tracking Setup ────────────────
+const videoElement = document.getElementById('webcam');
+const previewElement = document.getElementById('cam-preview');
+const statusDot = document.getElementById('statusDot');
+const statusText = document.getElementById('statusText');
+const startBtn = document.getElementById('startBtn');
+
+let isCameraReady = false;
+let fistDetected = false;
+
+// 1. Gesture Processing Algorithm (Fist Detection)
+function detectFist(landmarks) {
+  const wrist = landmarks[0];
+  const mcpMiddle = landmarks[9]; // Middle finger base joint
+  const palmSize = Math.hypot(mcpMiddle.x - wrist.x, mcpMiddle.y - wrist.y);
+
+  // Fingertip landmark IDs: Index(8), Middle(12), Ring(16), Pinky(20)
+  const fingerTips = [8, 12, 16, 20];
+  
+  for (let tipIdx of fingerTips) {
+    const tip = landmarks[tipIdx];
+    const distToWrist = Math.hypot(tip.x - wrist.x, tip.y - wrist.y);
+    // If any fingertip extends away from wrist, hand is OPEN (not a fist)
+    if (distToWrist > palmSize * 1.3) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// 2. MediaPipe Callback Function
+function onResults(results) {
+  if (!isCameraReady) {
+    isCameraReady = true;
+    startBtn.disabled = false;
+    startBtn.textContent = 'Start Game';
+    statusDot.classList.add('active');
+    statusText.textContent = 'Show Hand / Hold Fist ✊';
+  }
+
+  if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+    const hand = results.multiHandLandmarks[0];
+    fistDetected = detectFist(hand);
+
+    if (fistDetected) {
+      statusDot.className = 'status-dot fist';
+      statusText.textContent = '✊ Fist Locked & Controlling Ball';
+
+      // Landmark 9 (Palm Center) mapped to canvas coordinates
+      const palm = hand[9];
+      // Mirror the X coordinate for natural interaction
+      targetX = (1 - palm.x) * canvas.width;
+      targetY = palm.y * canvas.height;
+    } else {
+      statusDot.className = 'status-dot active';
+      statusText.textContent = '✋ Open Hand Detected (Make a ✊ Fist to Move)';
+    }
+  } else {
+    fistDetected = false;
+    statusDot.className = 'status-dot';
+    statusText.textContent = 'No Hand in Camera Frame';
+  }
+}
+
+// 3. Initialize MediaPipe Hands Detector
+const hands = new Hands({
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+});
+
+hands.setOptions({
+  maxNumHands: 1,
+  modelComplexity: 1,
+  minDetectionConfidence: 0.6,
+  minTrackingConfidence: 0.6
+});
+
+hands.onResults(onResults);
+
+// 4. Start Camera Feed
+const camera = new Camera(videoElement, {
+  onFrame: async () => {
+    await hands.send({ image: videoElement });
+  },
+  width: 640,
+  height: 480
+});
+
+camera.start().then(() => {
+  navigator.mediaDevices.getUserMedia({ video: true }).then(stream => {
+    previewElement.srcObject = stream;
+  });
+}).catch(err => {
+  statusText.textContent = 'Camera Access Denied!';
+  startBtn.textContent = 'Use Mouse Mode';
+  startBtn.disabled = false;
+});
+
+// ─── Game Physics & Gameplay Logic ─────────────────────────────────────
+const ENEMY_R = 11;
+let enemies = [];
+let particles = [];
+
+function initWeight() {
+  player.x  = targetX;
+  player.y  = targetY;
+  weight.x  = player.x;
+  weight.y  = player.y + REST_LEN;
+  weight.vx = 0;
+  weight.vy = 0;
+}
+
+function updateWeight(dt) {
+  const dx   = weight.x - player.x;
+  const dy   = weight.y - player.y;
+  const dist = Math.sqrt(dx * dx + dy * dy) || 0.001;
+  const nx   = dx / dist;
+  const ny   = dy / dist;
+
+  const stretch = dist - REST_LEN;
+  const fSpring = -SPRING_K * stretch;
+
+  const fDampX = -SPRING_DAMP * weight.vx;
+  const fDampY = -SPRING_DAMP * weight.vy;
+
+  weight.vx += (fSpring * nx + fDampX) * dt;
+  weight.vy += (fSpring * ny + fDampY + GRAVITY) * dt;
+  weight.x  += weight.vx * dt;
+  weight.y  += weight.vy * dt;
+}
+
+function spawnEnemy(difficulty) {
+  const side = Math.floor(Math.random() * 4);
+  let x, y;
+  const pad = ENEMY_R + 10;
+  const W = canvas.width, H = canvas.height;
+  if (side === 0) { x = Math.random() * W; y = -pad; }
+  else if (side === 1) { x = W + pad; y = Math.random() * H; }
+  else if (side === 2) { x = Math.random() * W; y = H + pad; }
+  else { x = -pad; y = Math.random() * H; }
+
+  const speed = 60 + difficulty * 16 + Math.random() * 20;
+  enemies.push({ x, y, speed });
+}
+
+function explode(x, y, color = '#16a34a') {
+  const count = 12 + Math.floor(Math.random() * 8);
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 40 + Math.random() * 120;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      r: 2 + Math.random() * 2,
+      life: 1,
+      decay: 0.8 + Math.random() * 0.8,
+      color
+    });
+  }
+}
+
+function segCircleDist2(ax, ay, bx, by, cx, cy) {
+  const dx = bx - ax, dy = by - ay;
+  const len2 = dx * dx + dy * dy;
+  if (len2 === 0) return (cx - ax) ** 2 + (cy - ay) ** 2;
+  const t = Math.max(0, Math.min(1, ((cx - ax) * dx + (cy - ay) * dy) / len2));
+  const px = ax + t * dx - cx;
+  const py = ay + t * dy - cy;
+  return px * px + py * py;
+}
+
+function startGame() {
+  score = 0; elapsed = 0; kills = 0;
+  enemies = []; particles = [];
+  initWeight();
+  state = 'playing';
+  document.getElementById('overlay').classList.add('hidden');
+  lastTime = performance.now();
+  requestAnimationFrame(loop);
+}
+
+function gameOver() {
+  state = 'dead';
+  const sc = Math.floor(elapsed) + kills * 5;
+  if (sc > highScore) highScore = sc;
+  explode(player.x, player.y, '#2563eb');
+  explode(weight.x, weight.y, '#dc2626');
+
+  setTimeout(() => {
+    const ov = document.getElementById('overlay');
+    document.getElementById('overlayTitle').textContent = 'Game Over';
+    document.getElementById('overlaySub').textContent = 'An enemy touched your target.';
+    document.getElementById('overlayScore').style.display = 'block';
+    document.getElementById('overlayScore').textContent = `${sc} Points`;
+    document.getElementById('overlayHS').style.display = 'block';
+    document.getElementById('overlayHS').textContent = `Best Score: ${highScore}`;
+    document.getElementById('startBtn').textContent = 'Play Again';
+    ov.classList.remove('hidden');
+  }, 600);
+}
+
+document.getElementById('startBtn').addEventListener('click', startGame);
+
+// ─── Main Game Loop ──────────────────────────────────────────────────
+let spawnTimer = 0;
+
+function loop(ts) {
+  if (state !== 'playing') return;
+
+  const dt = Math.min((ts - lastTime) / 1000, 0.05);
+  lastTime = ts;
+  elapsed += dt;
+
+  const difficulty = Math.min(elapsed / 30, 10);
+  spawnTimer += dt;
+  if (spawnTimer >= Math.max(0.35, 2.0 - difficulty * 0.16)) {
+    spawnTimer = 0;
+    spawnEnemy(difficulty);
+  }
+
+  // Smooth lerp movement toward Camera Fist Position
+  const lerpSpeed = 1 - Math.pow(0.001, dt);
+  player.x += (targetX - player.x) * lerpSpeed;
+  player.y += (targetY - player.y) * lerpSpeed;
+
+  updateWeight(dt);
+
+  // Collisions
+  for (let i = enemies.length - 1; i >= 0; i--) {
+    const e = enemies[i];
+    const dpx = player.x - e.x, dpy = player.y - e.y;
+    const dwx = weight.x  - e.x, dwy = weight.y  - e.y;
+    let tx = (dpx*dpx + dpy*dpy) < (dwx*dwx + dwy*dwy) ? player.x : weight.x;
+    let ty = (dpx*dpx + dpy*dpy) < (dwx*dwx + dwy*dwy) ? player.y : weight.y;
+    
+    const dist = Math.sqrt((tx - e.x) ** 2 + (ty - e.y) ** 2) || 1;
+    e.x += (tx - e.x) / dist * e.speed * dt;
+    e.y += (ty - e.y) / dist * e.speed * dt;
+
+    if (segCircleDist2(player.x, player.y, weight.x, weight.y, e.x, e.y) < (ENEMY_R + 3) ** 2) {
+      explode(e.x, e.y, '#16a34a');
+      kills++;
+      enemies.splice(i, 1);
+      continue;
+    }
+
+    if ((e.x - player.x) ** 2 + (e.y - player.y) ** 2 < (PLAYER_R + ENEMY_R) ** 2 ||
+        (e.x - weight.x) ** 2 + (e.y - weight.y) ** 2 < (WEIGHT_R + ENEMY_R) ** 2) {
+      gameOver(); return;
+    }
+  }
+
+  // Particles
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vx *= 0.92; p.vy *= 0.92; p.life -= p.decay * dt;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+
+  // Render
+  ctx.fillStyle = '#f8fafc';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Draw String
+  ctx.save();
+  ctx.strokeStyle = '#0f172a';
+  ctx.lineWidth   = 2.5;
+  ctx.beginPath();
+  ctx.moveTo(player.x, player.y);
+  ctx.lineTo(weight.x, weight.y);
+  ctx.stroke();
+  ctx.restore();
+
+  // Draw Enemies
+  for (const e of enemies) {
+    ctx.fillStyle = '#16a34a';
+    ctx.beginPath(); ctx.arc(e.x, e.y, ENEMY_R, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // Draw Red Weight
+  ctx.fillStyle = '#dc2626';
+  ctx.beginPath(); ctx.arc(weight.x, weight.y, WEIGHT_R, 0, Math.PI * 2); ctx.fill();
+
+  // Draw Blue Player
+  ctx.fillStyle = '#2563eb';
+  ctx.beginPath(); ctx.arc(player.x, player.y, PLAYER_R, 0, Math.PI * 2); ctx.fill();
+
+  // Draw Particles
+  for (const p of particles) {
+    ctx.globalAlpha = Math.max(0, p.life);
+    ctx.fillStyle   = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, Math.max(0.5, p.r * p.life), 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1.0;
+
+  // Draw HUD Score
+  const sc = Math.floor(elapsed) + kills * 5;
+  ctx.fillStyle = '#ffffff'; ctx.strokeStyle = '#e2e8f0'; ctx.lineWidth = 1;
+  ctx.fillRect(20, 20, 120, 44); ctx.strokeRect(20, 20, 120, 44);
+  ctx.fillStyle = '#0f172a'; ctx.font = '600 16px sans-serif';
+  ctx.fillText(`${sc} pts`, 34, 48);
+
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>
